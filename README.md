@@ -1,98 +1,180 @@
-# my_teslamate
+# teslamate-deploy
 
-个人 TeslaMate 一键部署工具集。
+> WorkBuddy skill that deploys [TeslaMate](https://github.com/teslamate/teslamate) (Tesla vehicle data logger + Grafana dashboards) to a local machine or a remote Linux server, end-to-end.
 
-包含两部分：
-
-| 目录 | 用途 |
-|---|---|
-| [`deploy/`](./deploy) | 4 个 shell 脚本 + compose 文件，把 TeslaMate 装到本地 Docker 或远程 Ubuntu/Debian 主机 |
-| [`skill/`](./skill) | WorkBuddy skill，让普通用户用一句「帮我装个 teslamate」就能走完部署 |
-| [`teslamate-deploy.zip`](./teslamate-deploy.zip) | 上面 `skill/` 打包好的 zip，给 WorkBuddy「从 zip 安装 skill」用 |
+[🇨🇳 中文说明](#中文说明) · [🇬🇧 English](#english)
 
 ---
 
-## 🚀 三种用法
+<a name="english"></a>
 
-### ① 直接跑脚本（CLI 玩家）
+## 🇬🇧 English
+
+A WorkBuddy skill — once installed, just say one of these in any WorkBuddy chat and it takes over:
+
+- *"Install TeslaMate"*
+- *"Deploy teslamate to 1.2.3.4"*
+- *"Set up a Tesla data logger"*
+- *"装个 teslamate"* / *"部署 teslamate"* / *"在云上跑个 teslamate"*
+
+The skill runs a 5-step workflow: **target confirm → pre-flight checks → run deploy → health check → generate usage doc**.
+
+### What you need
+
+- A Linux host (Ubuntu 22.04 / 24.04, x86_64 or aarch64) that you can SSH to as `ubuntu` (sudo NOPASSWD, key-based auth)
+- WorkBuddy installed on your local Mac/Linux
+
+### Install the skill
+
+**Option A — one-liner from the zip (easiest):**
 
 ```bash
-cd deploy
-chmod +x deploy-setup.sh install-teslamate.sh
-./deploy-setup.sh                  # 本机安装
-./deploy-setup.sh <remote-ip>      # 远程主机安装（默认 ubuntu@22）
+mkdir -p ~/.workbuddy/skills && \
+  curl -L -o /tmp/td.zip https://github.com/martinbj2008/my_teslamate/releases/latest/download/teslamate-deploy.zip && \
+  unzip -q -o /tmp/td.zip -d ~/.workbuddy/skills/ && \
+  rm /tmp/td.zip
 ```
 
-### ② WorkBuddy skill（小白玩家，推荐）
+**Option B — clone and copy:**
 
-把这个 repo clone 到本地，然后让 WorkBuddy 把 `skill/` 装上：
-
-```
-workbuddy 安装 skill，路径 /Users/<you>/my_teslamate/skill
-```
-
-或者直接用 `teslamate-deploy.zip`：
-
-```
-workbuddy 从 zip 安装 skill，文件 teslamate-deploy.zip
+```bash
+git clone https://github.com/martinbj2008/my_teslamate.git /tmp/my_teslamate && \
+  cp -R /tmp/my_teslamate ~/.workbuddy/skills/teslamate-deploy
 ```
 
-装完后在任何 workspace 直接说：
+Then restart WorkBuddy.
 
-> 「帮我装个 teslamate」
-> 「在 1.2.3.4 上部署 teslamate」
-> 「deploy teslamate to my ubuntu server」
+### Use it
 
-WorkBuddy 会自动跑 5 步流程：参数确认 → pre-flight 检查 → 调 deploy-setup.sh → 健康检查 → 生成使用文档。
+> *"Deploy TeslaMate to my server at 192.0.2.1"*
 
-### ③ 把 zip 发给别人
+WorkBuddy will:
+1. Ask you to confirm the target IP / SSH user
+2. Run pre-flight checks (OS version, sudo, ports 3000/4000/1883 free)
+3. Install Docker + pull 4 images + start the stack (~1.5 min)
+4. Verify TeslaMate `:4000`, Grafana `:3000`, Mosquitto `:1883`
+5. Generate a usage doc with your public URLs, Tesla-account setup steps, and ops commands
 
-`teslamate-deploy.zip` 可以直接发同事 / 传群文件 / 上 GitHub release。对方装上 WorkBuddy 之后：
+### Repo layout
 
-1. 打开 WorkBuddy → 设置 → Skill
-2. 「从本地 zip 安装」→ 选这个 zip
-3. 装完说「装 teslamate」就行
+```
+.
+├── SKILL.md                          ← WorkBuddy skill entry point
+├── scripts/
+│   ├── deploy-setup.sh               ← entry: no arg = local, 1 IP arg = remote
+│   ├── install-teslamate.sh          ← local install (pulls images, starts stack)
+│   ├── docker-compose.yml            ← 4 services: teslamate, postgres, grafana, mosquitto
+│   └── README.md                     ← plain-Shell usage (no WorkBuddy needed)
+├── references/
+│   └── troubleshooting.md            ← 8 categories of common failures + fixes
+├── teslamate-deploy.zip              ← packaged skill for one-liner install
+├── README.md                         ← this file
+├── LICENSE                           ← MIT
+└── .gitignore
+```
+
+### Security
+
+- **No real IPs or credentials in this repo.** Any example IPs use RFC 5737 reserved range (`192.0.2.1`).
+- The bundled `docker-compose.yml` uses TeslaMate's published default credentials (`admin/admin`, `teslamate/teslamate123`) — **change them immediately** after first login. The skill's Step 5 doc walks you through this.
+
+### Compatibility
+
+| Target | Status |
+|---|---|
+| Ubuntu 22.04 / 24.04 (x86_64) | ✅ Tested |
+| Ubuntu 22.04 (aarch64 / ARM) | ✅ Tested |
+| Debian 12 (x86_64) | 🟡 Should work (uses `apt-get`) — not yet tested |
+| macOS / Windows | ❌ Out of scope — use the local install path on a Linux host |
+
+### License
+
+MIT — see [LICENSE](./LICENSE).
 
 ---
 
-## 📋 skill 触发词
+<a name="中文说明"></a>
 
-WorkBuddy 看到下面这些说法都会自动接活：
+## 🇨🇳 中文说明
 
-- 中文：`装 teslamate` / `部署 teslamate` / `在云上跑个 teslamate` / `特斯拉数据记录安装`
-- English：`install teslamate` / `deploy teslamate` / `set up teslamate on my server`
+WorkBuddy skill。装上之后在任何 WorkBuddy 对话里说一句就能自动开干：
 
----
+- *"装个 teslamate"*
+- *"把 teslamate 部署到 1.2.3.4"*
+- *"在云上跑个 teslamate"*
+- *"install TeslaMate"*
 
-## 📦 文件清单
+完整流程 5 步：**目标确认 → 预检 → 跑部署 → 健康检查 → 生成使用文档**。
+
+### 前置条件
+
+- 一台 Linux 主机（Ubuntu 22.04 / 24.04，x86_64 或 aarch64）
+- 你能用 `ubuntu` 用户 SSH 上去（key 鉴权，sudo NOPASSWD）
+- 本地装了 WorkBuddy
+
+### 安装 skill
+
+**方式 A：一行命令（推荐）**
+
+```bash
+mkdir -p ~/.workbuddy/skills && \
+  curl -L -o /tmp/td.zip https://github.com/martinbj2008/my_teslamate/releases/latest/download/teslamate-deploy.zip && \
+  unzip -q -o /tmp/td.zip -d ~/.workbuddy/skills/ && \
+  rm /tmp/td.zip
+```
+
+**方式 B：clone 仓库再复制**
+
+```bash
+git clone https://github.com/martinbj2008/my_teslamate.git /tmp/my_teslamate && \
+  cp -R /tmp/my_teslamate ~/.workbuddy/skills/teslamate-deploy
+```
+
+装完重启 WorkBuddy。
+
+### 使用
+
+> *"把 TeslaMate 部署到 192.0.2.1"*
+
+WorkBuddy 会自动：
+1. 跟你确认目标 IP 和 SSH 用户
+2. 跑预检（系统版本、sudo、端口 3000/4000/1883 是否空闲）
+3. 装 Docker + 拉 4 个镜像 + 启动 stack（约 1.5 分钟）
+4. 验证 TeslaMate `:4000`、Grafana `:3000`、Mosquitto `:1883`
+5. 生成一份使用文档（含公网 URL、Tesla 账号绑定步骤、运维命令）
+
+### 仓库结构
 
 ```
-my_teslamate/
-├── README.md                       (本文件)
-├── .gitignore                      (排除 .env / logs / IDE 文件)
-├── deploy/                         (核心安装脚本)
-│   ├── README.md
-│   ├── deploy-setup.sh             (主入口: 无参=本地, 1参=远程)
-│   ├── install-teslamate.sh        (在已装 Docker 的目标上装 TeslaMate)
-│   └── docker-compose.yml
-├── skill/                          (WorkBuddy skill 源码)
-│   ├── SKILL.md                    (主入口)
-│   ├── references/
-│   │   └── troubleshooting.md      (8 类故障排查)
-│   └── scripts/                    (= deploy/ 的副本, 方便 skill 单独分发)
-└── teslamate-deploy.zip            (skill 的打包版本, 14KB)
+.
+├── SKILL.md                          ← WorkBuddy skill 入口
+├── scripts/
+│   ├── deploy-setup.sh               ← 主入口：无参=本地，1 个 IP=远程
+│   ├── install-teslamate.sh          ← 本机安装（拉镜像、起 stack）
+│   ├── docker-compose.yml            ← 4 个服务：teslamate, postgres, grafana, mosquitto
+│   └── README.md                     ← 纯 shell 用法（不依赖 WorkBuddy）
+├── references/
+│   └── troubleshooting.md            ← 8 类常见故障 + 修复
+├── teslamate-deploy.zip              ← 打包好的 skill，给一行命令安装用
+├── README.md                         ← 本文件
+├── LICENSE                           ← MIT
+└── .gitignore
 ```
 
----
+### 安全
 
-## 🔒 关于这个 repo
+- **仓库里没有任何真实 IP 或凭据**。示例 IP 全部用 RFC 5737 保留地址 `192.0.2.1`。
+- `docker-compose.yml` 里的默认密码（`admin/admin`、`teslamate/teslamate123`）来自 TeslaMate 官方文档 —— **首次登录后立刻改密**，使用文档第 7 节有步骤。
 
-- **公开 Public**：任何人都能 clone / fork
-- **已脱敏**：原 deploy 脚本示例中的服务器 IP（`43.136.44.121`）已替换为 RFC 5737 文档保留地址 `192.0.2.1`
-- **默认凭据**：脚本里的弱默认（`TM_DB_PASS=teslamate123` 等）是 TeslaMate 官方文档里的占位值，不是真凭据，部署完**第一件事**就是改密
+### 兼容性
 
----
+| 目标 | 状态 |
+|---|---|
+| Ubuntu 22.04 / 24.04 (x86_64) | ✅ 已测试 |
+| Ubuntu 22.04 (aarch64 / ARM) | ✅ 已测试 |
+| Debian 12 (x86_64) | 🟡 应该能跑（用的是 `apt-get`），未实测 |
+| macOS / Windows | ❌ 不支持 —— 请在 Linux 主机上装 |
 
-## 📜 License
+### 许可证
 
-MIT（沿用 TeslaMate 官方 docker-compose 模板的许可证惯例）
+MIT —— 见 [LICENSE](./LICENSE)。
