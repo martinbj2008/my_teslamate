@@ -27,6 +27,45 @@ die() {
     exit 1
 }
 
+# ---- 单连接复用 (OpenSSH ControlMaster) ----
+# 解决 "Connection closed by ... port 22" 错误：脚本原本会打开 6+ 个独立 SSH/scp
+# 会话，命中服务端 MaxSessions=10 限制。ControlMaster 让所有 ssh/scp 调用复用
+# 同一个 master socket，对服务端只算 1 个 session。
+SSH_OPTS=(
+    -o StrictHostKeyChecking=no
+    -o ControlMaster=auto
+    -o ControlPath="${TMPDIR:-/tmp}/teslamate-deploy-ssh-%r@%h:%p"
+    -o ControlPersist=600
+)
+SSH_TARGET=""  # 由 _ssh_remote / _scp_local 设置
+SSH_MASTER_PID=""
+
+_ssh_remote() {
+    # 第一次调用时建立 master（会占 1 个 session），之后所有调用复用它
+    local target="$1"; shift
+    SSH_TARGET="$target"
+    # 确保 master 存在
+    if ! ssh -O check "$target" 2>/dev/null; then
+        # 用 -N -f 在后台建 master（不实际开 shell）
+        ssh -fN "${SSH_OPTS[@]}" "$target" || die "无法建立到 $target 的 SSH 连接"
+    fi
+    # 执行实际命令（自动走 multiplex）
+    ssh "${SSH_OPTS[@]}" "$target" "$@"
+}
+
+_scp_local() {
+    # scp 也支持 ControlMaster（-o 透传）
+    local src="$1" dst="$2"
+    scp "${SSH_OPTS[@]}" "$src" "$dst"
+}
+
+_cleanup_ssh_master() {
+    if [ -n "$SSH_TARGET" ]; then
+        ssh -O exit "${SSH_OPTS[@]}" "$SSH_TARGET" 2>/dev/null || true
+    fi
+}
+trap _cleanup_ssh_master EXIT
+
 # 检查参数
 if [ $# -eq 0 ]; then
     # 无参数，执行本地安装
@@ -68,29 +107,30 @@ TM_DB_PASS="teslamate123"
 
 setup_server() {
     log "设置服务器环境..."
-    
-    ssh -o StrictHostKeyChecking=no "$USER@$SERVER_IP" << 'EOF'
+
+    # 用 ControlMaster 复用同一条连接，避免触发 MaxSessions
+    _ssh_remote "$USER@$SERVER_IP" << 'EOF'
         set -e
-        
+
         # 修复dpkg问题
         sudo dpkg --configure -a 2>/dev/null || true
-        
+
         # 更新包列表
         sudo apt-get update -y
-        
+
         echo "安装Docker环境..."
-        
+
         # 直接安装Docker和Docker Compose
         sudo apt-get install -y docker.io docker-compose-v2
-        
+
         echo "Docker环境安装完成"
-        
+
         # 验证Docker Compose是否可用
         if ! docker compose version >/dev/null 2>&1; then
             echo "错误：Docker Compose安装失败，请检查系统环境"
             exit 1
         fi
-        
+
         # 配置镜像加速器
         sudo mkdir -p /etc/docker
         sudo tee /etc/docker/daemon.json > /dev/null << 'DOCKER_CONFIG'
@@ -102,43 +142,51 @@ DOCKER_CONFIG
         sudo systemctl daemon-reload
         sudo systemctl enable docker
         sudo systemctl restart docker
-        
+
         echo "服务器环境设置完成"
 EOF
-    
+
     ok "服务器环境设置完成"
 }
 
 deploy_teslamate() {
     log "部署TeslaMate服务..."
-    
+
     # 检查本地docker-compose.yml文件是否存在
     if [ ! -f "docker-compose.yml" ]; then
         die "缺少docker-compose.yml文件，请先创建固定配置文件"
     fi
-    
-    # 创建目录（使用普通权限，因为是在用户主目录下）
-    ssh "$USER@$SERVER_IP" "mkdir -p $REMOTE_DIR && mkdir -p $REMOTE_DIR/import"
-    
-    # 传输docker-compose.yml文件
-    scp docker-compose.yml "$USER@$SERVER_IP:$REMOTE_DIR/" || die "传输docker-compose.yml失败"
-    
-    # 传输安装脚本到远程服务器
-    scp install-teslamate.sh "$USER@$SERVER_IP:$REMOTE_DIR/" || die "传输安装脚本失败"
-    
-    # 在远程服务器上执行安装脚本
-    ssh "$USER@$SERVER_IP" << EOF
+
+    # 一次SSH连接里完成：建目录 + scp + chmod
+    # 关键：把 docker-compose.yml 通过 base64 走 stdin 传过去，
+    # 彻底避免多次 scp 打开新 SSH 会话。
+    log "创建远程目录并传输文件（单连接）..."
+
+    COMPOSE_B64="$(base64 < docker-compose.yml | tr -d '\n')"
+    INSTALL_B64="$(base64 < install-teslamate.sh | tr -d '\n')"
+
+    _ssh_remote "$USER@$SERVER_IP" <<EOF
+        set -e
+        mkdir -p $REMOTE_DIR $REMOTE_DIR/import
+        # base64 解码写入
+        echo '${COMPOSE_B64}' | base64 -d > $REMOTE_DIR/docker-compose.yml
+        echo '${INSTALL_B64}'  | base64 -d > $REMOTE_DIR/install-teslamate.sh
+        chmod +x $REMOTE_DIR/install-teslamate.sh
+        # 校验文件存在且非空
+        test -s $REMOTE_DIR/docker-compose.yml
+        test -s $REMOTE_DIR/install-teslamate.sh
+        echo "files staged: \$(wc -c < $REMOTE_DIR/docker-compose.yml) bytes compose, \$(wc -c < $REMOTE_DIR/install-teslamate.sh) bytes install"
+EOF
+
+    # 在远程服务器上执行安装脚本（复用同一条 ControlMaster 连接）
+    log "远程执行安装脚本..."
+    _ssh_remote "$USER@$SERVER_IP" << EOF
         set -e
         cd $REMOTE_DIR
-        chmod +x install-teslamate.sh
-        ./install-teslamate.sh --install-docker
+        sudo ./install-teslamate.sh --install-docker
 EOF
-    
-    if [ $? -eq 0 ]; then
-        ok "TeslaMate部署成功"
-    else
-        die "TeslaMate部署失败"
-    fi
+
+    ok "TeslaMate部署成功"
 }
 
 show_result() {

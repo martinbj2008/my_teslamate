@@ -2,6 +2,43 @@
 
 Load this file when any step in the SKILL.md workflow fails. Each section gives the symptom, the likely cause, and a concrete fix. The user can run the shell snippets themselves if the AI hasn't already tried them.
 
+## 0. `deploy-setup.sh` / SSH transport problems
+
+### `Connection closed by <ip> port 22` (especially during the `scp` steps)
+
+**Symptom**: setup_server() succeeds, but `scp docker-compose.yml ...` or `scp install-teslamate.sh ...` fails with `Connection closed by <ip> port 22`. The first `ssh` works, then a few seconds later scp dies.
+
+**Cause**: the original `deploy-setup.sh` opens **6+ independent SSH/scp sessions** back-to-back (1 setup + 1 mkdir + 2 scp + 1 install = 6, with each `scp` opening a fresh SSH connection). OpenSSH defaults to `MaxSessions=10` and `MaxStartups=10:30:100`. Combined with any pre-existing connection in the pool, the 11th concurrent unauthenticated connection gets dropped.
+
+**Why the install-teslamate.sh step usually still works**: that one runs over a long-lived SSH connection inside a single shell, so it counts as 1 session.
+
+**Fix** (already applied in current `deploy-setup.sh`): use **OpenSSH ControlMaster multiplexing** so all ssh/scp calls share one master connection:
+```bash
+SSH_OPTS=(
+    -o ControlMaster=auto
+    -o ControlPath="${TMPDIR:-/tmp}/teslamate-deploy-ssh-%r@%h:%p"
+    -o ControlPersist=600
+)
+# First call: spawn master with -fN
+# Subsequent ssh/scp calls: share the master
+```
+
+If you can't upgrade the script, the **manual recovery** is to do everything sequentially in one shell:
+```bash
+ssh ubuntu@<ip> 'mkdir -p /home/ubuntu/teslamate'
+scp docker-compose.yml ubuntu@<ip>:/home/ubuntu/teslamate/
+scp install-teslamate.sh ubuntu@<ip>:/home/ubuntu/teslamate/
+ssh ubuntu@<ip> 'cd /home/ubuntu/teslamate && sudo ./install-teslamate.sh --install-docker'
+```
+…with a 2-3 second `sleep` between each call.
+
+**To verify it's a MaxSessions problem** (not auth/network): check the server's `sshd_config`:
+```bash
+ssh ubuntu@<ip> 'sudo grep -E "^(MaxSessions|MaxStartups)" /etc/ssh/sshd_config'
+# Default: MaxSessions 10, MaxStartups 10:30:100
+```
+If those are non-default and lower, that's the smoking gun.
+
 ## 1. `install-teslamate.sh` errors
 
 ### `dpkg: error: dpkg frontend is locked by another process`
