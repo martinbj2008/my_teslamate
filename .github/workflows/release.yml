@@ -1,0 +1,112 @@
+name: Release
+
+# 当 push 一个形如 v* 的 tag 时，自动：
+#   1) 把 SKILL.md / scripts / references 包成 teslamate-deploy.zip
+#      （关键：包一层 teslamate-deploy/ 顶层目录，这样 unzip -d ~/.workbuddy/skills/
+#       会直接形成正确的 skill 目录结构，不会平铺文件）
+#   2) 用 GitHub 提供的 GITHUB_TOKEN 创建 release 并把 zip 作为 asset 上传
+#
+# 配合这条 workflow 发布 release 的完整流程：
+#   # 1. 改代码（这里不需要手动改 version）
+#   # 2. commit + push 到 main
+#   # 3. 打 tag
+#   git tag -a v1.0.1 -m "..."
+#   git push origin v1.0.1
+#   # 4. 看 Actions 页：https://github.com/martinbj2008/my_teslamate/actions
+#   # 5. 跑完后 release 在：https://github.com/martinbj2008/my_teslamate/releases/latest
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # 创建 release + 上传 asset 需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build skill zip
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          BUILD_DIR=$(mktemp -d)
+          # 关键：在 zip 顶层包一个 teslamate-deploy/ 目录
+          # 这样用户 `unzip -d ~/.workbuddy/skills/` 后会形成正确的 skill 目录
+          mkdir -p "$BUILD_DIR/teslamate-deploy"
+          cp -R SKILL.md scripts references "$BUILD_DIR/teslamate-deploy/"
+
+          (cd "$BUILD_DIR" && zip -r skill.zip teslamate-deploy -x '*.DS_Store')
+          mv "$BUILD_DIR/skill.zip" dist/teslamate-deploy.zip
+          rm -rf "$BUILD_DIR"
+
+          echo "--- dist/teslamate-deploy.zip 内容 ---"
+          unzip -l dist/teslamate-deploy.zip
+          echo
+          echo "--- 文件大小 ---"
+          ls -lh dist/teslamate-deploy.zip
+
+      - name: Extract release notes from CHANGELOG (optional)
+        id: notes
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            # 抓 ## [vX.Y.Z] 到下一个 ## 之间的内容
+            VERSION="${GITHUB_REF_NAME#v}"
+            awk -v ver="[$VERSION]" '
+              $0 == "## " ver {flag=1; next}
+              /^## / && flag {flag=0}
+              flag
+            ' CHANGELOG.md > release_notes.md
+            if [ -s release_notes.md ]; then
+              echo "extracted=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "extracted=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "extracted=false" >> "$GITHUB_OUTPUT"
+          fi
+        continue-on-error: true
+
+      - name: Create release and upload zip
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: teslamate-deploy ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/teslamate-deploy.zip
+          body: |
+            ## teslamate-deploy ${{ github.ref_name }}
+
+            WorkBuddy skill that deploys **TeslaMate** (Tesla vehicle data logger +
+            Grafana dashboards) to a local machine or a remote Linux server.
+
+            ### 📦 Install
+
+            ```bash
+            mkdir -p ~/.workbuddy/skills && \
+              curl -L -o /tmp/td.zip https://github.com/martinbj2008/my_teslamate/releases/latest/download/teslamate-deploy.zip && \
+              unzip -q -o /tmp/td.zip -d ~/.workbuddy/skills/ && \
+              rm /tmp/td.zip
+            ```
+
+            Then restart WorkBuddy. Triggers: *"deploy teslamate"*, *"装 teslamate"*,
+            *"set up Tesla data logger"*, etc.
+
+            ### 🚀 Usage
+
+            Open WorkBuddy and say something like:
+
+            > "Deploy teslamate to 1.2.3.4"
+            > "帮我装个 teslamate"
+
+            The skill will confirm the target VM, run pre-flight checks, deploy the
+            4-container stack (TeslaMate + Postgres + Grafana + Mosquitto), verify
+            health, and produce a usage document.
+
+            See [README](https://github.com/martinbj2008/my_teslamate#readme) for
+            full details.
