@@ -67,6 +67,8 @@ WorkBuddy will:
 │   └── README.md                     ← plain-Shell usage (no WorkBuddy needed)
 ├── references/
 │   └── troubleshooting.md            ← 8 categories of common failures + fixes
+├── .github/
+│   └── workflows/release.yml         ← auto-build zip + create release on tag push
 ├── teslamate-deploy.zip              ← packaged skill for one-liner install
 ├── README.md                         ← this file
 ├── LICENSE                           ← MIT
@@ -86,6 +88,32 @@ WorkBuddy will:
 | Ubuntu 22.04 (aarch64 / ARM) | ✅ Tested |
 | Debian 12 (x86_64) | 🟡 Should work (uses `apt-get`) — not yet tested |
 | macOS / Windows | ❌ Out of scope — use the local install path on a Linux host |
+
+### Releasing a new version
+
+The release is fully automated via GitHub Actions — no manual upload. The workflow
+in `.github/workflows/release.yml` watches for tag pushes matching `v*`, builds
+the zip with the correct `teslamate-deploy/` top-level directory wrapper, and
+attaches it to a fresh GitHub release.
+
+```bash
+# 1. Commit your changes
+git add -A
+git commit -m "..."
+
+# 2. Push to main
+git push origin main
+
+# 3. Tag and push — workflow does the rest
+git tag -a v1.0.1 -m "..."
+git push origin v1.0.1
+
+# 4. Watch the build
+open https://github.com/martinbj2008/my_teslamate/actions
+
+# 5. Release + zip ready at
+#    https://github.com/martinbj2008/my_teslamate/releases/latest
+```
 
 ### License
 
@@ -155,6 +183,8 @@ WorkBuddy 会自动：
 │   └── README.md                     ← 纯 shell 用法（不依赖 WorkBuddy）
 ├── references/
 │   └── troubleshooting.md            ← 8 类常见故障 + 修复
+├── .github/
+│   └── workflows/release.yml         ← push tag 后自动 build zip + 发 release
 ├── teslamate-deploy.zip              ← 打包好的 skill，给一行命令安装用
 ├── README.md                         ← 本文件
 ├── LICENSE                           ← MIT
@@ -174,6 +204,30 @@ WorkBuddy 会自动：
 | Ubuntu 22.04 (aarch64 / ARM) | ✅ 已测试 |
 | Debian 12 (x86_64) | 🟡 应该能跑（用的是 `apt-get`），未实测 |
 | macOS / Windows | ❌ 不支持 —— 请在 Linux 主机上装 |
+
+### 发新版本
+
+发布完全自动化 —— 不需要手动上传。`.github/workflows/release.yml` 监听
+`v*` tag 的 push，自动 build zip（包好 `teslamate-deploy/` 顶层目录）并 attach 到 release。
+
+```bash
+# 1. 改完代码
+git add -A
+git commit -m "..."
+
+# 2. push 到 main
+git push origin main
+
+# 3. 打 tag 并 push —— 剩下 workflow 干
+git tag -a v1.0.1 -m "..."
+git push origin v1.0.1
+
+# 4. 看构建进度
+open https://github.com/martinbj2008/my_teslamate/actions
+
+# 5. 完成后 release + zip 在
+#    https://github.com/martinbj2008/my_teslamate/releases/latest
+```
 
 ### 许可证
 
