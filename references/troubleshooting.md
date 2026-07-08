@@ -129,6 +129,132 @@ sudo systemctl restart docker
 sudo docker pull postgres:17
 ```
 
+### All mirrors time out only for `postgres:17` (or specific image)
+
+**Symptom**: `docker pull alpine:3.19` works fast (seconds), `docker pull postgres:17` hangs forever on "Pulling fs layer" with no progress. Multiple public mirrors all exhibit the same hang.
+
+**Cause**: this specific image's manifest or blobs aren't cached at the public mirror backend, or the mirror is rate-limiting. Different images go to different backend shards.
+
+**Fix — relay host strategy**: use a host that has working network as a "staging area" to pull the image, save it as a tar, then load it on the target:
+
+```bash
+# On relay host (e.g. a Tencent CVM that has mirror.ccs.tencentyun.com working)
+ssh ubuntu@RELAY_IP
+sudo docker pull postgres:17                  # 32s on a CVM with internal mirror
+sudo docker save postgres:17 -o /tmp/pg17.tar
+sudo chmod 644 /tmp/pg17.tar                  # let non-sudo scp read it
+exit
+
+# On your Mac (the deploy machine)
+scp ubuntu@RELAY_IP:/tmp/pg17.tar /tmp/pg17.tar
+scp /tmp/pg17.tar root@TARGET_IP:/tmp/pg17.tar
+
+# On target
+ssh root@TARGET_IP
+docker load -i /tmp/pg17.tar
+rm /tmp/pg17.tar
+cd /root/teslamate
+docker compose up -d
+```
+
+Total transfer: ~160MB for postgres:17. Takes ~3 minutes round-trip vs 5+ minutes of hanging with no progress.
+
+### GitHub image download (alternative to relay host)
+
+`prepare-images.sh` supports downloading pre-packaged images from GitHub as a fallback when `docker pull` fails due to mirror issues.
+
+**GitHub repo**: `https://github.com/martinbj2008/docker_images`
+
+**Directory structure**:
+```
+docker_images/
+├── eclipse-mosquitto/
+│   └── 2/
+│       ├── eclipse-mosquitto-2.tar.gz
+│       └── sha256sums.txt
+├── postgres/
+│   └── 17/
+│       ├── postgres-17.tar.gz.aa   (split if >90MB)
+│       ├── postgres-17.tar.gz.ab
+│       └── sha256sums.txt
+├── teslamate_teslamate/
+│   └── latest/
+│       ├── teslamate_teslamate-latest.tar.gz
+│       └── sha256sums.txt
+└── teslamate_grafana/
+    └── latest/
+        ├── teslamate_grafana-latest.tar.gz.aa
+        ├── teslamate_grafana-latest.tar.gz.ab
+        ├── teslamate_grafana-latest.tar.gz.ac
+        └── sha256sums.txt
+```
+
+**Manual download and load (without prepare-images.sh)**:
+```bash
+# Single-file image (<90MB)
+curl -sL https://raw.githubusercontent.com/martinbj2008/docker_images/main/postgres/17/postgres-17.tar.gz \
+  | gunzip | docker load
+
+# Split image (>90MB): download all parts, cat, gunzip, load
+for suf in aa ab ac; do
+  curl -sL "https://raw.githubusercontent.com/martinbj2008/docker_images/main/teslamate_grafana/latest/teslamate_grafana-latest.tar.gz.$suf" \
+    -o "/tmp/part.$suf"
+done
+cat /tmp/part.* | gunzip | docker load
+rm /tmp/part.*
+```
+
+**To upload new versions** (run on a machine with Docker + SSH key to GitHub):
+```bash
+cd /path/to/skill/scripts
+./prepare-images.sh upload
+```
+This saves all 4 images, splits files >90MB, generates SHA256 checksums, and pushes to GitHub.
+
+### `dial tcp [2a03:2880:...:443]: i/o timeout` (IPv6 path is blackholed)
+
+**Symptom**: even with `registry-mirrors` configured, `docker pull` fails with:
+```
+dial tcp [2a03:2880:f107:83:face:b00c:0:25de]:443: i/o timeout
+```
+
+**Cause**: `getent ahosts registry-1.docker.io` returns both A and AAAA records; the system resolver picks the AAAA first; but the IPv6 path to that range is blackholed (common on home ISPs, China Telecom residential, etc.).
+
+**Fix — force IPv4 in the system resolver**:
+```bash
+# Check what gai.conf currently has
+grep -v "^#" /etc/gai.conf | grep -v "^$" || echo "gai.conf empty"
+# Add the IPv4 precedence rule
+echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf
+# Re-test
+getent ahosts registry-1.docker.io   # should now show only A records
+```
+
+Combined with the `daemon.json` setting `"ipv6": false, "ip6tables": false`, Docker daemon will now resolve and connect over IPv4.
+
+### `dial tcp: lookup mirror.ccs.tencentyun.com: no such host`
+
+**Cause**: `mirror.ccs.tencentyun.com` is a **Tencent Cloud internal mirror**, only resolvable from inside a Tencent Cloud VPC. If the target is on a home LAN or a non-Tencent cloud, the DNS lookup will fail and Docker will use it as a registry, fail all pulls.
+
+**Fix**: the skill now auto-detects which mirror is resolvable (see `install_docker()` in `install-teslamate.sh`). For manual override:
+
+```bash
+# 1. Check what's resolvable from this host
+getent hosts mirror.ccs.tencentyun.com && echo "tencent internal: OK" || echo "tencent internal: NO"
+getent hosts docker.1ms.run && echo "1ms.run: OK" || echo "1ms.run: NO"
+getent hosts docker.m.daocloud.io && echo "daocloud: OK" || echo "daocloud: NO"
+
+# 2. Pick one that's OK and write to daemon.json
+sudo tee /etc/docker/daemon.json > /dev/null << 'EOF'
+{
+  "ipv6": false,
+  "ip6tables": false,
+  "registry-mirrors": ["https://docker.1ms.run"]
+}
+EOF
+sudo systemctl restart docker
+```
+
 ## 3. Port conflicts
 
 ### `bind: address already in use` on 3000 / 4000 / 1883
@@ -202,6 +328,49 @@ sudo docker compose down
 ./install-teslamate.sh
 ```
 
+### Restart prompts re-login, logs show `No ENCRYPTION_KEY was found` / `Could not decrypt API tokens!`
+
+**Symptom**: after `docker restart teslamate-teslamate-1` (or any host reboot), the Web UI immediately shows the sign-in page again. `docker logs teslamate-teslamate-1` shows:
+```
+[warning] No ENCRYPTION_KEY was found to encrypt and securely store your API tokens.
+[warning] Create an environment variable named "ENCRYPTION_KEY" with the value set to the key above...
+[warning] Could not decrypt API tokens!
+```
+
+**Cause**: TeslaMate encrypts the stored API refresh token with a key. On first start, if no `ENCRYPTION_KEY` env is set, it generates a random 32-byte base64 key for that session and stores the encrypted token in the `settings` table. On every restart, with no env set, a **new** random key is generated → the old encrypted token can't be decrypted → user must re-login.
+
+**Fix — set a fixed `ENCRYPTION_KEY` env var in `docker-compose.yml` and re-login once**:
+
+```bash
+# 1. Generate a fixed key (keep this safe; changing it later invalidates stored tokens)
+openssl rand -base64 32
+# → e.g. EvJgrT/546llnPOnGhG4fT8FDoWDD9ttni3x0GA+FIo=
+
+# 2. Add to teslamate service environment in docker-compose.yml
+#    services.teslamate.environment:
+#      - MQTT_HOST=mosquitto
+#      - ENCRYPTION_KEY=EvJgrT/546llnPOnGhG4fT8FDoWDD9ttni3x0GA+FIo=
+sed -i '/MQTT_HOST=mosquitto/a\      - ENCRYPTION_KEY=EvJgrT/546llnPOnGhG4fT8FDoWDD9ttni3x0GA+FIo=' \
+  /root/teslamate/docker-compose.yml
+
+# 3. Recreate the container (this WILL log out the user; they need to sign in once)
+cd /root/teslamate && docker compose up -d teslamate
+
+# 4. Open http://<host>:4000/sign_in, paste the REFRESH token, submit
+#    → this writes a new token encrypted with your fixed key
+#    → future restarts will decrypt it automatically
+```
+
+**Important**: the value must be 32 random bytes encoded as base64 (44 chars including `=`). Don't use a guessable string. Don't change it after the first successful login unless you're willing to do one more manual re-login.
+
+**Verification** that the env is being picked up:
+```bash
+ssh root@<host> 'docker exec teslamate-teslamate-1 env | grep ENCRYPTION_KEY'
+# Should print ENCRYPTION_KEY=EvJgrT...
+```
+
+**Why this trips up most users**: the warning message in the logs is easy to miss because teslamate keeps running and the web UI just redirects to `/sign_in` silently. The user thinks "oh, just a transient blip" and re-logs in, only to hit the same wall on the next restart.
+
 ### Grafana says "login attempt failed" after the user changed `admin/admin`
 
 **Fix**: reset Grafana admin password via the official env var:
@@ -221,6 +390,75 @@ sudo docker compose up -d grafana
 **Cause**: most common cause is using a *legacy* token (the old auth flow that Tesla deprecated in 2023). User must re-generate.
 
 **Fix**: walk the user through https://docs.teslamate.org/docs/guides/initial_setup — they need to log into `auth.tesla.com` (NOT `owner-api.teslamotors.com`) in a *normal browser session*, grab a fresh refresh token, and paste it into TeslaMate. The token is ~700 chars and starts with `eyJ…`.
+
+### TeslaMate web UI: "Error: 令牌 无效" (token invalid) — within minutes of pasting
+
+**Symptom**: user runs `tesla_auth` (the `tesla_auth-aarch64-apple-darwin` binary from adrianj/tesla_auth), gets a valid-looking access token, copies it to TeslaMate, and the UI immediately says "令牌 无效" (token invalid). The error message in the UI looks like:
+> 令牌 eyJ... 刷新令牌 eyJ...
+> 通过 Tesla API 获得令牌需要有编程经验或者借助第三方服务。更多信息可以查看 [这里]。
+
+**TeslaMate v4 sign-in page has TWO input boxes** (not one as previously documented): "令牌" (Token) and "刷新令牌" (Refresh Token). User must fill BOTH with the access + refresh tokens respectively. Internally, TeslaMate only uses the refresh token (it does the `auth.tesla.cn POST /oauth2/v3/token` call to exchange for an access token — this is what you see in the logs as `POST auth.tesla.cn -> 200`).
+
+**Most common actual causes of "令牌 无效"** (in order of likelihood):
+
+1. **Network timeout to `auth.tesla.cn`**: TeslaMate's internal HTTP client (Finch) has a ~5s timeout. `auth.tesla.cn` from China residential ISPs / cloud servers can occasionally respond in 6-8s. The log will show:
+   ```
+   [error] POST https://auth.tesla.cn/oauth2/v3/token -> error: %Finch.TransportError{reason: :timeout, ...} (~6800ms)
+   ```
+   The token is fine; just retry.
+
+2. **User pasted the access token, not the refresh token**: `tesla_auth` outputs two tokens. The **refresh token** is what TeslaMate needs (it then exchanges for access token). The refresh token is the second `eyJ...` block, ~3 months valid. Decoding JWT payloads to tell them apart:
+   - Access: has `exp` field (8h after `iat`), `aud` is an array, has `azp: ownerapi`
+   - Refresh: no `exp`, `aud` is the string `https://auth.tesla.cn/oauth2/v3/token`, has a nested `data: {...}` object
+
+3. **Stale UI state from a previous failed attempt**: the error message persists on the sign-in page even after the underlying issue is fixed. User must **reload the page** (Cmd+Shift+R for hard reload) before retrying.
+
+**🚨 NEVER paste Tesla tokens in chat** — they are valid credentials. Use `/root/teslamate/set-auth-v2.sh` on the target host (it prompts over SSH, no token in chat/logs). If a token is accidentally exposed, revoke it immediately at https://auth.tesla.cn or change the Tesla account password (invalidates all active refresh tokens).
+
+**Bypass the UI entirely** (most reliable when network is flaky): the setup script writes `TM_AUTH_TOKEN` directly to `/root/teslamate/.env` and restarts the container — no HTTP round-trip to Tesla during the auth write, so GFW flakiness doesn't matter.
+
+**Architecture is NOT the issue** — `tesla_auth` is a local OAuth client; whether you run it on `aarch64-apple-darwin` (M1/M2 Mac), `arm32`, or `x86_64`, the JWT output is the same string. Tesla's auth server validates by `exp` timestamp, not by client architecture.
+
+**System clock skew is also NOT the issue** on this stack — both Mac and the target host use NTP, typically within 1 second. (Verify with `date '+%s'` on both sides.)
+
+**Three fixes (in order of preference):**
+
+1. **Best: switch to Tesla API Key (permanent, no expiry)**:
+   - Go to https://developer.tesla.com/ → log in with Tesla account → "API Access" tab → "Add API Key"
+   - Required scopes: `vehicle_device_data`, `vehicle_cmds`, `vehicle_location`
+   - In TeslaMate's `.env`, set `TM_API_KEY=<your-key>` (instead of `TM_AUTH_TOKEN`)
+   - Restart `docker compose up -d teslamate`
+
+2. **Quick (legacy): use the REFRESH token from tesla_auth, not the access token**:
+   - Re-run `tesla_auth` if you don't have the refresh token anymore
+   - Paste the **REFRESH TOKEN** (the second block) into TeslaMate's web UI
+   - The refresh token lasts ~3 months, so this is a one-time setup
+
+3. **Setup script for safe token entry** — write to target's `/root/teslamate/set-auth.sh` (already done on this user's box):
+   ```bash
+   #!/bin/bash
+   set -e
+   ENV_FILE=/root/teslamate/.env
+   cp "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+   sed -i -E '/^TM_AUTH_TOKEN=/d; /^TM_API_KEY=/d; /^TM_VIN=/d' "$ENV_FILE"
+   echo "Choose: 1=legacy OAuth (REFRESH token, ~3 months), 2=API key (permanent)"
+   read -p "[1/2] (default 1): " method
+   method=${method:-1}
+   if [ "$method" = "2" ]; then
+       read -p "Paste Tesla API key: " k
+       echo "TM_API_KEY=$k" >> "$ENV_FILE"
+   else
+       echo "IMPORTANT: paste the REFRESH TOKEN (second block from tesla_auth),"
+       echo "NOT the access token (which expires in 8h)."
+       read -p "Paste Tesla REFRESH token: " t
+       echo "TM_AUTH_TOKEN=$t" >> "$ENV_FILE"
+   fi
+   read -p "Vehicle VIN (17 chars): " v
+   echo "TM_VIN=$v" >> "$ENV_FILE"
+   cd /root/teslamate && docker compose up -d teslamate
+   sleep 10 && docker compose logs --tail=20 teslamate
+   ```
+   User runs `ssh root@<ip> '/root/teslamate/set-auth.sh'` and pastes values when prompted. Token never appears in shell history or logs.
 
 ### TeslaMate can fetch the car once, then "401 unauthorized" on the next refresh
 

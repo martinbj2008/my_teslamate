@@ -27,41 +27,80 @@ die() {
     exit 1
 }
 
-# ---- 单连接复用 (OpenSSH ControlMaster) ----
-# 解决 "Connection closed by ... port 22" 错误：脚本原本会打开 6+ 个独立 SSH/scp
-# 会话，命中服务端 MaxSessions=10 限制。ControlMaster 让所有 ssh/scp 调用复用
-# 同一个 master socket，对服务端只算 1 个 session。
+# ---- SSH 连接 ----
+# 支持两种认证方式:
+#   SSH key (默认) — 用 ControlMaster 复用连接，避免 MaxSessions 限制
+#   SSH 密码     — 设 SSH_PASS 环境变量，走 sshpass（密码一次性输入，存于会话）
+#
+# 首次连接处理：两种模式都用 -o StrictHostKeyChecking=no 自动跳过 yes/no 确认，
+# 配合 UserKnownHostsFile=/dev/null + LogLevel=ERROR 彻底避免交互式提示干扰 sshpass。
+#
+# 路径长度坑：macOS 的 Unix domain socket 路径上限 ~104 字符（含 null 终止符），
+# 实际比这短就会被拒。%C 会产出 30+ 字符的 hash，HOME/.cache/... 这种路径会爆。
+# 解决：用 /tmp/tm-ssh/ + 自算 8 字符 hash，整条 < 30 字符，留足 buffer。
+TM_SSH_DIR="/tmp/tm-ssh"
+mkdir -p "$TM_SSH_DIR"
+_short_hash() {
+    # shasum 不可用时 fallback 到 cksum / od
+    if command -v shasum >/dev/null 2>&1; then
+        echo -n "$1" | shasum -a 256 | cut -c1-8
+    else
+        echo -n "$1" | cksum | awk '{print $1}' | head -c 8
+    fi
+}
+# 首次连接自动接受 host key（sshpass 模式下必须，否则 yes/no 提示会吞掉密码输入）
+HOST_KEY_OPTS=(
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR
+)
 SSH_OPTS=(
     -o StrictHostKeyChecking=no
     -o ControlMaster=auto
-    -o ControlPath="${TMPDIR:-/tmp}/teslamate-deploy-ssh-%r@%h:%p"
     -o ControlPersist=600
 )
-SSH_TARGET=""  # 由 _ssh_remote / _scp_local 设置
-SSH_MASTER_PID=""
+# 实际的 ControlPath 在 _ssh_remote / _scp_local 里按 target 单独算
+SSH_TARGET=""
 
 _ssh_remote() {
-    # 第一次调用时建立 master（会占 1 个 session），之后所有调用复用它
     local target="$1"; shift
     SSH_TARGET="$target"
-    # 确保 master 存在
-    if ! ssh -O check "$target" 2>/dev/null; then
-        # 用 -N -f 在后台建 master（不实际开 shell）
-        ssh -fN "${SSH_OPTS[@]}" "$target" || die "无法建立到 $target 的 SSH 连接"
+
+    if [ -n "${SSH_PASS:-}" ]; then
+        # 密码模式：不用 ControlMaster，直接用 sshpass
+        # -o StrictHostKeyChecking=no / UserKnownHostsFile / LogLevel 保证首次连接无交互
+        sshpass -p "$SSH_PASS" ssh "${HOST_KEY_OPTS[@]}" "$target" "$@"
+    else
+        # 密钥模式：ControlMaster 复用
+        local cp="$TM_SSH_DIR/$(_short_hash "$target")"
+        local opts=("${SSH_OPTS[@]}" "-o" "ControlPath=$cp")
+        if ! ssh -O check "${opts[@]}" "$target" 2>/dev/null; then
+            ssh -fN "${opts[@]}" "$target" || die "无法建立到 $target 的 SSH 连接"
+        fi
+        ssh "${opts[@]}" "$target" "$@"
     fi
-    # 执行实际命令（自动走 multiplex）
-    ssh "${SSH_OPTS[@]}" "$target" "$@"
 }
 
 _scp_local() {
-    # scp 也支持 ControlMaster（-o 透传）
     local src="$1" dst="$2"
-    scp "${SSH_OPTS[@]}" "$src" "$dst"
+    if [ -n "${SSH_PASS:-}" ] && [ -n "$SSH_TARGET" ]; then
+        sshpass -p "$SSH_PASS" scp "${HOST_KEY_OPTS[@]}" "$src" "$dst"
+    elif [ -n "$SSH_TARGET" ]; then
+        local cp="$TM_SSH_DIR/$(_short_hash "$SSH_TARGET")"
+        scp "${SSH_OPTS[@]}" -o "ControlPath=$cp" "$src" "$dst"
+    else
+        scp "${SSH_OPTS[@]}" "$src" "$dst"
+    fi
 }
 
 _cleanup_ssh_master() {
+    # 密码模式没有 master connection 需要清理
+    [ -n "${SSH_PASS:-}" ] && return 0
     if [ -n "$SSH_TARGET" ]; then
-        ssh -O exit "${SSH_OPTS[@]}" "$SSH_TARGET" 2>/dev/null || true
+        local cp="$TM_SSH_DIR/$(_short_hash "$SSH_TARGET")"
+        local opts=("${SSH_OPTS[@]}" "-o" "ControlPath=$cp")
+        ssh -O exit "${opts[@]}" "$SSH_TARGET" 2>/dev/null || true
+        rm -f "$cp" "$cp.*" 2>/dev/null
     fi
 }
 trap _cleanup_ssh_master EXIT
@@ -86,18 +125,25 @@ if [ $# -ne 1 ]; then
     echo "用法: $0 [服务器IP]"
     echo ""
     echo "选项:"
-    echo "  无参数      执行本地安装"
-    echo "  <服务器IP>  执行远程部署"
+    echo "  无参数                              执行本地安装"
+    echo "  <服务器IP>                          执行远程部署 (默认用户 ubuntu)"
+    echo "  REMOTE_USER=root \$0 <服务器IP>      指定远端用户 (如 root 配免密登录)"
     echo ""
     echo "示例:"
-    echo "  $0                    # 本地安装"
-    echo "  $0 192.0.2.1     # 远程部署"
+    echo "  \$0                            # 本地安装"
+    echo "  \$0 192.0.2.1                  # 远程 ubuntu@192.0.2.1"
+    echo "  REMOTE_USER=root \$0 192.0.2.1 # 远程 root@192.0.2.1 (如 Armbian 盒子)"
     exit 1
 fi
 
 SERVER_IP="$1"
-USER="ubuntu"
-REMOTE_DIR="/home/$USER/teslamate"
+# 远端用户: 默认 ubuntu；可由调用方通过环境变量 REMOTE_USER 覆盖（如 root 用于 Armbian/已配免密的盒子）
+USER="${REMOTE_USER:-ubuntu}"
+# REMOTE_DIR: 远端用户的 home 下的 teslamate 目录；root 走 /root，其余走 /home/$USER
+case "$USER" in
+    root) REMOTE_DIR="/root/teslamate" ;;
+    *)    REMOTE_DIR="/home/$USER/teslamate" ;;
+esac
 
 log "开始 TeslaMate 远程部署到服务器: $SERVER_IP"
 
@@ -115,15 +161,30 @@ setup_server() {
         # 修复dpkg问题
         sudo dpkg --configure -a 2>/dev/null || true
 
-        # 更新包列表
-        sudo apt-get update -y
+        # 强制 IPv4 优先（解决 IPv6 黑洞路由问题，比如 docker.io 的 AAAA 记录到 Facebook 段）
+        if ! grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null; then
+            echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf >/dev/null
+        fi
 
-        echo "安装Docker环境..."
+        # 先检查 docker compose 是否已可用 —— 如果可用则跳过整个 apt install 阶段（节省 5+ 分钟）
+        _has_compose=0
+        if command -v docker-compose &> /dev/null; then _has_compose=1; fi
+        if docker compose version &> /dev/null 2>&1; then _has_compose=1; fi
+        if [ -x /usr/libexec/docker/cli-plugins/docker-compose ]; then _has_compose=1; fi
+        if [ -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then _has_compose=1; fi
 
-        # 直接安装Docker和Docker Compose
-        sudo apt-get install -y docker.io docker-compose-v2
+        if [ $_has_compose -eq 0 ]; then
+            echo "Docker Compose 未安装，开始安装 Docker 环境..."
 
-        echo "Docker环境安装完成"
+            # 更新包列表
+            sudo apt-get update -y
+
+            # 直接安装Docker和Docker Compose
+            # Debian 12 (含 Armbian 26.x) 上 V2 compose 包名是 docker-compose-plugin，docker-compose-v2 已废弃
+            sudo apt-get install -y docker.io docker-compose-plugin || sudo apt-get install -y docker-compose-plugin
+        else
+            echo "Docker Compose 已安装，跳过 apt install"
+        fi
 
         # 验证Docker Compose是否可用
         if ! docker compose version >/dev/null 2>&1; then
@@ -131,13 +192,36 @@ setup_server() {
             exit 1
         fi
 
-        # 配置镜像加速器
+        # 配置镜像加速器 — 只配能解析的 mirror
+        # 优先腾讯云内网（云上机器），其次公网 mirror（家用网络）；全部解析不到则不配
+        _mirror_url=""
+        for url in "https://mirror.ccs.tencentyun.com" "https://docker.1ms.run" "https://docker.m.daocloud.io"; do
+            _host=$(echo "$url" | sed 's|https://||')
+            if getent hosts "$_host" >/dev/null 2>&1; then
+                _mirror_url="$url"
+                break
+            fi
+        done
+
         sudo mkdir -p /etc/docker
-        sudo tee /etc/docker/daemon.json > /dev/null << 'DOCKER_CONFIG'
+        if [ -n "$_mirror_url" ]; then
+            echo "使用 Docker mirror: $_mirror_url"
+            sudo tee /etc/docker/daemon.json > /dev/null << DOCKER_CONFIG
 {
-  "registry-mirrors": ["https://mirror.ccs.tencentyun.com"]
+  "ipv6": false,
+  "ip6tables": false,
+  "registry-mirrors": ["${_mirror_url}"]
 }
 DOCKER_CONFIG
+        else
+            echo "未找到可用的 Docker mirror，跳过配置"
+            sudo tee /etc/docker/daemon.json > /dev/null << 'DOCKER_CONFIG'
+{
+  "ipv6": false,
+  "ip6tables": false
+}
+DOCKER_CONFIG
+        fi
 
         sudo systemctl daemon-reload
         sudo systemctl enable docker
@@ -152,13 +236,13 @@ EOF
 deploy_teslamate() {
     log "部署TeslaMate服务..."
 
-    # 检查本地docker-compose.yml文件是否存在
-    if [ ! -f "docker-compose.yml" ]; then
-        die "缺少docker-compose.yml文件，请先创建固定配置文件"
+    # 检查本地脚本文件是否存在
+    if [ ! -f "docker-compose.yml" ] || [ ! -f "install-teslamate.sh" ]; then
+        die "缺少必要文件 (docker-compose.yml / install-teslamate.sh)"
     fi
 
     # 一次SSH连接里完成：建目录 + scp + chmod
-    # 关键：把 docker-compose.yml 通过 base64 走 stdin 传过去，
+    # 关键：把 docker-compose.yml 和 install-teslamate.sh 通过 base64 走 stdin 传过去，
     # 彻底避免多次 scp 打开新 SSH 会话。
     log "创建远程目录并传输文件（单连接）..."
 
@@ -169,7 +253,7 @@ deploy_teslamate() {
         set -e
         mkdir -p $REMOTE_DIR $REMOTE_DIR/import
         # base64 解码写入
-        echo '${COMPOSE_B64}' | base64 -d > $REMOTE_DIR/docker-compose.yml
+        echo '${COMPOSE_B64}'  | base64 -d > $REMOTE_DIR/docker-compose.yml
         echo '${INSTALL_B64}'  | base64 -d > $REMOTE_DIR/install-teslamate.sh
         chmod +x $REMOTE_DIR/install-teslamate.sh
         # 校验文件存在且非空
