@@ -53,14 +53,47 @@ check_docker() {
     if ! sudo docker info &> /dev/null; then
         log "Docker服务未运行，尝试启动服务..."
         sudo systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null
-        
+
         # 再次检查
         if ! sudo docker info &> /dev/null; then
             die "Docker服务启动失败，请手动检查Docker服务状态"
         fi
     fi
-    
+
+    # 不管 Docker 是否预装，都配置 mirror + 网络优化（对腾讯云内网机器尤其重要）
+    configure_docker_network
+
     ok "Docker环境检查通过"
+}
+
+# 配置 Docker mirror + 网络优化（独立函数，可在 check_docker 和 install_docker 中复用）
+configure_docker_network() {
+    sudo mkdir -p /etc/docker
+    local _mirror_url; _mirror_url=$(detect_mirror_url)
+    if [ -n "$_mirror_url" ]; then
+        log "配置 Docker mirror: $_mirror_url"
+        sudo tee /etc/docker/daemon.json > /dev/null << DOCKER_CONFIG
+{
+  "ipv6": false,
+  "ip6tables": false,
+  "registry-mirrors": ["${_mirror_url}"]
+}
+DOCKER_CONFIG
+    else
+        sudo tee /etc/docker/daemon.json > /dev/null << 'DOCKER_CONFIG'
+{
+  "ipv6": false,
+  "ip6tables": false
+}
+DOCKER_CONFIG
+    fi
+    # 强制 IPv4 优先
+    if ! grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null; then
+        echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf >/dev/null
+    fi
+    sudo systemctl daemon-reload
+    sudo systemctl restart docker
+    ok "Docker 网络配置完成"
 }
 
 # 安装Docker环境（仅限Ubuntu/Debian）
@@ -73,29 +106,17 @@ install_docker() {
     # 更新包列表
     sudo apt-get update -y
 
-    # 安装Docker和Docker Compose
-    # Debian 12 (含 Armbian 26.x) 上 V2 compose 包名是 docker-compose-plugin，docker-compose-v2 已废弃
-    sudo apt-get install -y docker.io docker-compose-plugin || sudo apt-get install -y docker-compose-plugin
-
-    # 配置镜像加速器 — 只配能解析的 mirror（避免内网域名被配到外网机器导致全部 pull 失败）
-    sudo mkdir -p /etc/docker
-    _mirror_url=$(detect_mirror_url)
-    sudo tee /etc/docker/daemon.json > /dev/null << DOCKER_CONFIG
-{
-  "ipv6": false,
-  "ip6tables": false,
-  "registry-mirrors": ["${_mirror_url}"]
-}
-DOCKER_CONFIG
-
-    # 强制 IPv4 优先（解决 IPv6 黑洞路由问题，比如 docker.io 的 AAAA 记录到 Facebook 段）
-    if ! grep -q "^precedence ::ffff:0:0/96 100" /etc/gai.conf 2>/dev/null; then
-        echo "precedence ::ffff:0:0/96 100" | sudo tee -a /etc/gai.conf >/dev/null
+    # 安装Docker和Docker Compose — 兼容不同 Ubuntu/Debian 版本
+    # docker-compose-plugin: Debian 12 / Ubuntu 24.04
+    # docker-compose-v2:     Ubuntu 26.04+
+    if ! sudo apt-get install -y docker.io docker-compose-plugin 2>/dev/null && \
+       ! sudo apt-get install -y docker-compose-v2 2>/dev/null; then
+        sudo apt-get install -y docker-compose-plugin
     fi
 
-    sudo systemctl daemon-reload
+    configure_docker_network
+
     sudo systemctl enable docker
-    sudo systemctl restart docker
 
     ok "Docker环境安装完成"
 }

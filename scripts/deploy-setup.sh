@@ -179,9 +179,13 @@ setup_server() {
             # 更新包列表
             sudo apt-get update -y
 
-            # 直接安装Docker和Docker Compose
-            # Debian 12 (含 Armbian 26.x) 上 V2 compose 包名是 docker-compose-plugin，docker-compose-v2 已废弃
-            sudo apt-get install -y docker.io docker-compose-plugin || sudo apt-get install -y docker-compose-plugin
+            # 直接安装Docker和Docker Compose — 兼容不同 Ubuntu/Debian 版本
+            # docker-compose-plugin: Debian 12 / Ubuntu 24.04
+            # docker-compose-v2:     Ubuntu 26.04+
+            if ! sudo apt-get install -y docker.io docker-compose-plugin 2>/dev/null && \
+               ! sudo apt-get install -y docker-compose-v2 2>/dev/null; then
+                sudo apt-get install -y docker-compose-plugin
+            fi
         else
             echo "Docker Compose 已安装，跳过 apt install"
         fi
